@@ -8309,6 +8309,7 @@ FEProblemBase::createMortarInterface(
     const bool correct_edge_dropping,
     const Real minimum_projection_angle,
     const MooseEnum & triangulation,
+    const bool global_polygon_mesh,
     const bool triangulate_triangles)
 {
   _has_mortar = true;
@@ -8323,6 +8324,7 @@ FEProblemBase::createMortarInterface(
                                                correct_edge_dropping,
                                                minimum_projection_angle,
                                                triangulation,
+                                               global_polygon_mesh,
                                                triangulate_triangles);
   else
     return _mortar_data->createMortarInterface(primary_secondary_boundary_pair,
@@ -8334,6 +8336,7 @@ FEProblemBase::createMortarInterface(
                                                correct_edge_dropping,
                                                minimum_projection_angle,
                                                triangulation,
+                                               global_polygon_mesh,
                                                triangulate_triangles);
 }
 

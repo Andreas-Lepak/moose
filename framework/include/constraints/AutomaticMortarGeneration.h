@@ -76,6 +76,7 @@ public:
                             const bool correct_edge_dropping,
                             const Real minimum_projection_angle,
                             const MortarSegmentTriangulationMode triangulation_mode,
+                            const bool global_polygon_mesh,
                             const bool triangulate_triangles);
 
   /**
@@ -176,6 +177,12 @@ public:
    * @return The nodal normals associated with the provided \p secondary_elem
    */
   std::vector<Point> getNodalNormals(const Elem & secondary_elem) const;
+
+  /**
+   * Compute the helper-plane measure of a secondary mortar sub-element.
+   */
+  Real getSecondarySubElemMeasure(const Elem & secondary_elem,
+                                  unsigned int secondary_sub_elem_index) const;
 
   /**
    * Compute the two nodal tangents, which are built on-the-fly.
@@ -520,6 +527,9 @@ private:
 
   /// Triangulation mode used for clipped 3D mortar polygons.
   const MortarSegmentTriangulationMode _triangulation_mode;
+
+  /// Whether 3D overlap polygons should first be assembled into a continuous polygonal supermesh.
+  const bool _global_polygon_mesh;
 
   /// Whether already-triangular clipped polygons should still be centroid-subdivided.
   const bool _triangulate_triangles;

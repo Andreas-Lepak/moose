@@ -89,6 +89,29 @@ public:
   Real area(const std::vector<Point> & nodes) const;
 
   /**
+   * Get the projected secondary polygon stored by this helper.
+   */
+  const std::vector<Point> & secondaryPoly() const { return _secondary_poly; }
+
+  /**
+   * Map a helper-plane point back to the corresponding physical point on the linearized patch.
+   */
+  Point physicalPoint(const Point & local_point) const
+  {
+    return (local_point(0) * _u) + (local_point(1) * _v) + _center;
+  }
+
+  /**
+   * Get the dimensional area tolerance used by this helper.
+   */
+  Real areaTolerance() const { return _area_tol; }
+
+  /**
+   * Get the dimensional length tolerance used by this helper.
+   */
+  Real lengthTolerance() const { return _length_tol; }
+
+  /**
    * Get center point of secondary element
    */
   const Point & center() const { return _center; }

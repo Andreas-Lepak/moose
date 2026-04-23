@@ -268,6 +268,11 @@ ContactAction::validParams()
       "centroid-based path because the vertex-fan, ear-clipping, and Delaunay backends cannot "
       "refine a triangle any further on their own.");
   params.addParam<bool>(
+      "global_polygon_mesh",
+      false,
+      "Whether clipped 3D mortar overlap polygons should first be assembled into a continuous "
+      "polygonal mesh before the selected triangulation is applied.");
+  params.addParam<bool>(
       "generate_mortar_mesh",
       true,
       "Whether to generate the mortar mesh from the action. Typically this will be the case, but "
@@ -420,6 +425,11 @@ ContactAction::ContactAction(const InputParameters & params)
              _formulation != ContactFormulation::MORTAR_PENALTY)
       paramError("triangulate_triangles",
                  "The 'triangulate_triangles' option can only be used with mortar-based "
+                 "formulations.");
+    else if (params.isParamSetByUser("global_polygon_mesh") &&
+             _formulation != ContactFormulation::MORTAR_PENALTY)
+      paramError("global_polygon_mesh",
+                 "The 'global_polygon_mesh' option can only be used with mortar-based "
                  "formulations.");
     else if (params.isParamSetByUser("use_dual") &&
              _formulation != ContactFormulation::MORTAR_PENALTY)
@@ -954,6 +964,7 @@ ContactAction::addMortarContact()
                                         {"correct_edge_dropping",
                                          "triangulation",
                                          "triangulate_triangles",
+                                         "global_polygon_mesh",
                                          "use_petrov_galerkin",
                                          "debug_mesh"});
       if (getParam<bool>("use_petrov_galerkin"))
@@ -988,6 +999,7 @@ ContactAction::addMortarContact()
                                         {"correct_edge_dropping",
                                          "triangulation",
                                          "triangulate_triangles",
+                                         "global_polygon_mesh",
                                          "use_petrov_galerkin",
                                          "debug_mesh"});
       if (getParam<bool>("use_petrov_galerkin"))
@@ -1015,6 +1027,7 @@ ContactAction::addMortarContact()
                                         {"correct_edge_dropping",
                                          "triangulation",
                                          "triangulate_triangles",
+                                         "global_polygon_mesh",
                                          "penalty",
                                          "debug_mesh",
                                          "max_penalty_multiplier",
@@ -1086,6 +1099,7 @@ ContactAction::addMortarContact()
       uo_params.applySpecificParameters(parameters(),
                                         {"triangulation",
                                          "triangulate_triangles",
+                                         "global_polygon_mesh",
                                          "friction_coefficient",
                                          "penalty",
                                          "penalty_friction"});
@@ -1137,6 +1151,7 @@ ContactAction::addMortarContact()
                                      {"correct_edge_dropping",
                                       "triangulation",
                                       "triangulate_triangles",
+                                      "global_polygon_mesh",
                                       "normalize_c",
                                       "extra_vector_tags",
                                       "absolute_value_vector_tags",
@@ -1198,6 +1213,7 @@ ContactAction::addMortarContact()
       params.applySpecificParameters(parameters(),
                                      {"triangulation",
                                       "triangulate_triangles",
+                                      "global_polygon_mesh",
                                       "extra_vector_tags",
                                       "absolute_value_vector_tags",
                                       "debug_mesh"});
@@ -1236,6 +1252,7 @@ ContactAction::addMortarContact()
       params.applySpecificParameters(parameters(),
                                      {"triangulation",
                                       "triangulate_triangles",
+                                      "global_polygon_mesh",
                                       "extra_vector_tags",
                                       "absolute_value_vector_tags",
                                       "debug_mesh"});

@@ -26,9 +26,11 @@ formulations:
 
 In addition, face/face contact using a mortar method can also be specified using this block.
 
-For 3D mortar contact, the triangulation of clipped overlap polygons can be selected with the
-`triangulation` parameter. The `triangulate_triangles` parameter controls whether polygons that
-are already triangles are left intact or centroid-subdivided again.
+For 3D mortar contact, the `global_polygon_mesh` parameter can be used to first assemble clipped
+overlap fragments into a continuous polygonal mortar mesh before triangulating the final polygon
+cells. The `triangulation` parameter then selects how each final polygon cell is split into
+triangles, and `triangulate_triangles` controls whether polygons that are already triangles are
+left intact or centroid-subdivided again.
 
 ## Constructed Objects
 

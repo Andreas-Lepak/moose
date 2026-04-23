@@ -76,6 +76,7 @@ MortarInterfaceWarehouse::createMortarInterface(
     const bool correct_edge_dropping,
     const Real minimum_projection_angle,
     const MooseEnum & triangulation,
+    const bool global_polygon_mesh,
     const bool triangulate_triangles)
 {
   _mortar_subdomain_coverage.insert(subdomain_key.first);
@@ -91,6 +92,8 @@ MortarInterfaceWarehouse::createMortarInterface(
   auto & mortar_segment_triangulation_map = on_displaced
                                                 ? _displaced_mortar_segment_triangulation_map
                                                 : _mortar_segment_triangulation_map;
+  auto & global_polygon_mesh_map =
+      on_displaced ? _displaced_global_polygon_mesh_map : _global_polygon_mesh_map;
   auto & triangulate_triangles_map =
       on_displaced ? _displaced_triangulate_triangles_map : _triangulate_triangles_map;
   auto & mortar_interfaces = on_displaced ? _displaced_mortar_interfaces : _mortar_interfaces;
@@ -127,6 +130,15 @@ MortarInterfaceWarehouse::createMortarInterface(
         mortar_segment_triangulation_map_iterator,
         std::make_pair(boundary_key, mortar_segment_triangulation_name));
 
+  auto global_polygon_mesh_map_iterator = global_polygon_mesh_map.find(boundary_key);
+  if (global_polygon_mesh_map_iterator != global_polygon_mesh_map.end() &&
+      global_polygon_mesh_map_iterator->second != global_polygon_mesh)
+    mooseError("We do not currently support multiple values of 'global_polygon_mesh' on the same "
+               "boundary primary-secondary surface pair.");
+  else
+    global_polygon_mesh_map.insert(global_polygon_mesh_map_iterator,
+                                   std::make_pair(boundary_key, global_polygon_mesh));
+
   auto triangulate_triangles_map_iterator = triangulate_triangles_map.find(boundary_key);
   if (triangulate_triangles_map_iterator != triangulate_triangles_map.end() &&
       triangulate_triangles_map_iterator->second != triangulate_triangles)
@@ -151,6 +163,7 @@ MortarInterfaceWarehouse::createMortarInterface(
                                                     correct_edge_dropping,
                                                     minimum_projection_angle,
                                                     triangulation_mode,
+                                                    global_polygon_mesh,
                                                     triangulate_triangles));
     if (inserted)
       it->second->initOutput();

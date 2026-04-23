@@ -42,6 +42,8 @@ public:
    * @param minimum_projection_angle minimum projection angle allowed for building mortar segment
    * mesh
    * @param triangulation triangulation strategy used for clipped 3D mortar polygons
+   * @param global_polygon_mesh whether 3D overlap polygons should first be assembled into a
+   * continuous polygonal supermesh before triangulation
    * @param triangulate_triangles whether a clipped polygon that is already a triangle should still
    * be subdivided
    */
@@ -54,6 +56,7 @@ public:
                              const bool correct_edge_dropping,
                              const Real minimum_projection_angle,
                              const MooseEnum & triangulation,
+                             const bool global_polygon_mesh,
                              const bool triangulate_triangles);
 
   /**
@@ -177,6 +180,12 @@ private:
 
   /// Map from displaced AMG key to the selected mortar segment triangulation strategy
   std::unordered_map<MortarKey, std::string> _displaced_mortar_segment_triangulation_map;
+
+  /// Map from undisplaced AMG key to whether a continuous polygonal supermesh is constructed
+  std::unordered_map<MortarKey, bool> _global_polygon_mesh_map;
+
+  /// Map from displaced AMG key to whether a continuous polygonal supermesh is constructed
+  std::unordered_map<MortarKey, bool> _displaced_global_polygon_mesh_map;
 
   /// Map from undisplaced AMG key to whether already-triangular polygons are further subdivided
   std::unordered_map<MortarKey, bool> _triangulate_triangles_map;

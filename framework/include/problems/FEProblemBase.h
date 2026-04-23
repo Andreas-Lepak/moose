@@ -1966,6 +1966,7 @@ public:
       const bool correct_edge_dropping,
       const Real minimum_projection_angle,
       const MooseEnum & triangulation,
+      const bool global_polygon_mesh,
       const bool triangulate_triangles);
 
   /**

@@ -49,6 +49,11 @@
 
 #include <array>
 #include <algorithm>
+#include <limits>
+#include <map>
+#include <numeric>
+#include <optional>
+#include <tuple>
 
 using namespace libMesh;
 using MetaPhysicL::DualNumber;
@@ -61,6 +66,88 @@ namespace nanoflann
 typedef SearchParams SearchParameters;
 }
 #endif
+
+namespace
+{
+using SecondarySubElemKey = std::pair<dof_id_type, unsigned int>;
+
+struct SecondarySubElemKeyHash
+{
+  std::size_t operator()(const SecondarySubElemKey & key) const noexcept
+  {
+    const auto hash0 = std::hash<dof_id_type>{}(key.first);
+    const auto hash1 = std::hash<unsigned int>{}(key.second);
+    return hash0 ^ (hash1 + 0x9e3779b97f4a7c15ULL + (hash0 << 6) + (hash0 >> 2));
+  }
+};
+
+std::vector<unsigned int>
+getMortarSubElemNodes(const ElemType type, const unsigned int sub_elem)
+{
+  switch (type)
+  {
+    case TRI3:
+      return {{0, 1, 2}};
+    case QUAD4:
+      return {{0, 1, 2, 3}};
+    case TRI6:
+    case TRI7:
+      switch (sub_elem)
+      {
+        case 0:
+          return {{0, 3, 5}};
+        case 1:
+          return {{3, 4, 5}};
+        case 2:
+          return {{3, 1, 4}};
+        case 3:
+          return {{5, 4, 2}};
+        default:
+          mooseError("getMortarSubElemNodes: Invalid sub_elem: ", sub_elem);
+      }
+    case QUAD8:
+      switch (sub_elem)
+      {
+        case 0:
+          return {{0, 4, 7}};
+        case 1:
+          return {{4, 1, 5}};
+        case 2:
+          return {{5, 2, 6}};
+        case 3:
+          return {{7, 6, 3}};
+        case 4:
+          return {{4, 5, 6, 7}};
+        default:
+          mooseError("getMortarSubElemNodes: Invalid sub_elem: ", sub_elem);
+      }
+    case QUAD9:
+      switch (sub_elem)
+      {
+        case 0:
+          return {{0, 4, 8, 7}};
+        case 1:
+          return {{4, 1, 5, 8}};
+        case 2:
+          return {{8, 5, 2, 6}};
+        case 3:
+          return {{7, 8, 6, 3}};
+        default:
+          mooseError("getMortarSubElemNodes: Invalid sub_elem: ", sub_elem);
+      }
+    default:
+      mooseError("getMortarSubElemNodes: Face element type: ",
+                 Utility::enum_to_string<ElemType>(type),
+                 " invalid for 3D mortar");
+  }
+}
+
+Real
+orient2d(const Point & a, const Point & b, const Point & c)
+{
+  return (b(0) - a(0)) * (c(1) - a(1)) - (b(1) - a(1)) * (c(0) - a(0));
+}
+}
 
 class MortarNodalGeometryOutput : public Output
 {
@@ -225,6 +312,7 @@ AutomaticMortarGeneration::AutomaticMortarGeneration(
     const bool correct_edge_dropping,
     const Real minimum_projection_angle,
     const MortarSegmentTriangulationMode triangulation_mode,
+    const bool global_polygon_mesh,
     const bool triangulate_triangles)
   : ConsoleStreamInterface(app),
     _app(app),
@@ -237,6 +325,7 @@ AutomaticMortarGeneration::AutomaticMortarGeneration(
     _correct_edge_dropping(correct_edge_dropping),
     _minimum_projection_angle(minimum_projection_angle),
     _triangulation_mode(triangulation_mode),
+    _global_polygon_mesh(global_polygon_mesh),
     _triangulate_triangles(triangulate_triangles)
 {
   _primary_secondary_boundary_id_pairs.push_back(boundary_key);
@@ -338,6 +427,30 @@ AutomaticMortarGeneration::getNodalNormals(const Elem & secondary_elem) const
     nodal_normals[n] = _secondary_node_to_nodal_normal.at(secondary_elem.node_ptr(n));
 
   return nodal_normals;
+}
+
+Real
+AutomaticMortarGeneration::getSecondarySubElemMeasure(const Elem & secondary_elem,
+                                                      const unsigned int secondary_sub_elem_index) const
+{
+  const auto sub_elem_nodes = getMortarSubElemNodes(secondary_elem.type(), secondary_sub_elem_index);
+  const auto nodal_normals = getNodalNormals(secondary_elem);
+  Point center;
+  Point normal;
+  std::vector<Point> nodes(sub_elem_nodes.size());
+  for (const auto iv : index_range(sub_elem_nodes))
+  {
+    const auto n = sub_elem_nodes[iv];
+    nodes[iv] = secondary_elem.point(n);
+    center += secondary_elem.point(n);
+    normal += nodal_normals[n];
+  }
+  center /= sub_elem_nodes.size();
+  normal = normal.unit();
+
+  MortarSegmentHelper helper(
+      nodes, center, normal, MortarSegmentTriangulationMode::vertex, false);
+  return helper.area(helper.secondaryPoly());
 }
 
 const Elem *
@@ -943,12 +1056,134 @@ AutomaticMortarGeneration::buildMortarSegmentMesh()
 void
 AutomaticMortarGeneration::buildMortarSegmentMesh3d()
 {
+  struct PendingOverlayPolygon
+  {
+    const Elem * secondary_elem = nullptr;
+    const Elem * primary_elem = nullptr;
+    const MortarSegmentHelper * helper = nullptr;
+    unsigned int secondary_sub_elem = libMesh::invalid_uint;
+    unsigned int primary_sub_elem = libMesh::invalid_uint;
+    std::vector<Point> local_nodes;
+    std::vector<Point> projected_primary_nodes;
+  };
+
   // Add an integer flag to mortar segment mesh to keep track of which subelem
   // of second order primal elements mortar segments correspond to
   auto secondary_sub_elem = _mortar_segment_mesh->add_elem_integer("secondary_sub_elem");
   auto primary_sub_elem = _mortar_segment_mesh->add_elem_integer("primary_sub_elem");
 
   dof_id_type local_id_index = 0;
+  const bool use_global_polygon_mesh = _global_polygon_mesh;
+
+  if (use_global_polygon_mesh && _distributed)
+    mooseError("The 'global_polygon_mesh' option currently requires a replicated mortar segment "
+               "mesh.");
+
+  std::unordered_map<SecondarySubElemKey,
+                     std::unique_ptr<MortarSegmentHelper>,
+                     SecondarySubElemKeyHash>
+      overlay_helpers;
+  std::unordered_map<SecondarySubElemKey, Real, SecondarySubElemKeyHash>
+      secondary_sub_elem_measure_cache;
+  std::vector<PendingOverlayPolygon> pending_overlay_polygons;
+  std::vector<Node *> global_polygon_mesh_nodes;
+  if (use_global_polygon_mesh)
+    global_polygon_mesh_nodes.reserve(1024);
+
+  const auto secondary_sub_elem_measure =
+      [&](const Elem & secondary_elem, const unsigned int secondary_sub_elem_index)
+  {
+    const SecondarySubElemKey key{secondary_elem.id(), secondary_sub_elem_index};
+    if (const auto cached = secondary_sub_elem_measure_cache.find(key);
+        cached != secondary_sub_elem_measure_cache.end())
+      return cached->second;
+
+    const Real measure = getSecondarySubElemMeasure(secondary_elem, secondary_sub_elem_index);
+    secondary_sub_elem_measure_cache.emplace(key, measure);
+    return measure;
+  };
+
+  const auto materialize_mortar_segment_batch =
+      [&](const Elem * secondary_side_elem,
+          const Elem * primary_elem_candidate,
+          const std::vector<Point> & nodal_points,
+          const std::vector<std::vector<unsigned int>> & elem_to_node_map,
+          const std::vector<std::pair<unsigned int, unsigned int>> & sub_elem_map,
+          std::set<Elem *, CompareDofObjectsByID> & secondary_to_msm_element_set)
+  {
+    if (elem_to_node_map.empty())
+      return;
+
+    std::vector<Node *> new_nodes;
+    new_nodes.reserve(nodal_points.size());
+
+    const Real batch_merge_tolerance =
+        use_global_polygon_mesh && !sub_elem_map.empty()
+            ? std::max(100. * TOLERANCE,
+                       std::sqrt(
+                           std::max(secondary_sub_elem_measure(*secondary_side_elem,
+                                                               sub_elem_map.front().first),
+                                    TOLERANCE)) *
+                           1e-8)
+            : 0.;
+
+    for (const auto & pt : nodal_points)
+    {
+      Node * new_node = nullptr;
+
+      if (use_global_polygon_mesh)
+        for (auto * const existing_node : global_polygon_mesh_nodes)
+          if (((*existing_node) - pt).norm() <= batch_merge_tolerance)
+          {
+            new_node = existing_node;
+            break;
+          }
+
+      if (!new_node)
+      {
+        new_node = _mortar_segment_mesh->add_point(
+            pt, _mortar_segment_mesh->max_node_id(), secondary_side_elem->processor_id());
+        if (use_global_polygon_mesh)
+          global_polygon_mesh_nodes.push_back(new_node);
+      }
+
+      new_nodes.push_back(new_node);
+    }
+
+    for (const auto el : index_range(elem_to_node_map))
+    {
+      std::unique_ptr<Elem> new_elem;
+      if (elem_to_node_map[el].size() == 3)
+        new_elem = std::make_unique<Tri3>();
+      else
+        mooseError("Active mortar segments only supports TRI elements, 3 nodes expected but: ",
+                   elem_to_node_map[el].size(),
+                   " provided.");
+
+      new_elem->processor_id() = secondary_side_elem->processor_id();
+      new_elem->subdomain_id() = secondary_side_elem->subdomain_id();
+      new_elem->set_id(local_id_index++);
+
+      for (const auto i : index_range(elem_to_node_map[el]))
+        new_elem->set_node(i, new_nodes[elem_to_node_map[el][i]]);
+
+      const Real measure = secondary_sub_elem_measure(*secondary_side_elem, sub_elem_map[el].first);
+      if (measure <= TOLERANCE || new_elem->volume() / measure < TOLERANCE)
+        continue;
+
+      Elem * const msm_new_elem = _mortar_segment_mesh->add_elem(new_elem.release());
+      msm_new_elem->set_extra_integer(secondary_sub_elem, sub_elem_map[el].first);
+      msm_new_elem->set_extra_integer(primary_sub_elem, sub_elem_map[el].second);
+
+      MortarSegmentInfo msinfo;
+      msinfo.secondary_elem = secondary_side_elem;
+      msinfo.primary_elem = primary_elem_candidate;
+      _msm_elem_to_info.emplace(msm_new_elem, msinfo);
+      secondary_to_msm_element_set.insert(msm_new_elem);
+      _secondary_ip_sub_ids.insert(msinfo.secondary_elem->interior_parent()->subdomain_id());
+      _primary_ip_sub_ids.insert(msinfo.primary_elem->interior_parent()->subdomain_id());
+    }
+  };
 
   // Loop through mortar secondary and primary pairs to create mortar segment mesh between each
   for (const auto & pr : _primary_secondary_subdomain_id_pairs)
@@ -964,68 +1199,6 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
     // Construct the KD tree.
     kd_tree.buildIndex();
 
-    // Define expression for getting sub-elements nodes (for sub-dividing secondary elements)
-    auto get_sub_elem_nodes = [](const ElemType type,
-                                 const unsigned int sub_elem) -> std::vector<unsigned int>
-    {
-      switch (type)
-      {
-        case TRI3:
-          return {{0, 1, 2}};
-        case QUAD4:
-          return {{0, 1, 2, 3}};
-        case TRI6:
-        case TRI7:
-          switch (sub_elem)
-          {
-            case 0:
-              return {{0, 3, 5}};
-            case 1:
-              return {{3, 4, 5}};
-            case 2:
-              return {{3, 1, 4}};
-            case 3:
-              return {{5, 4, 2}};
-            default:
-              mooseError("get_sub_elem_nodes: Invalid sub_elem: ", sub_elem);
-          }
-        case QUAD8:
-          switch (sub_elem)
-          {
-            case 0:
-              return {{0, 4, 7}};
-            case 1:
-              return {{4, 1, 5}};
-            case 2:
-              return {{5, 2, 6}};
-            case 3:
-              return {{7, 6, 3}};
-            case 4:
-              return {{4, 5, 6, 7}};
-            default:
-              mooseError("get_sub_elem_nodes: Invalid sub_elem: ", sub_elem);
-          }
-        case QUAD9:
-          switch (sub_elem)
-          {
-            case 0:
-              return {{0, 4, 8, 7}};
-            case 1:
-              return {{4, 1, 5, 8}};
-            case 2:
-              return {{8, 5, 2, 6}};
-            case 3:
-              return {{7, 8, 6, 3}};
-            default:
-              mooseError("get_sub_elem_nodes: Invalid sub_elem: ", sub_elem);
-          }
-        default:
-          mooseError("get_sub_elem_inds: Face element type: ",
-                     libMesh::Utility::enum_to_string<ElemType>(type),
-                     " invalid for 3D mortar");
-      }
-    };
-
     /**
      *  Step 1: Build mortar segments for all secondary elements
      */
@@ -1035,8 +1208,6 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
          ++el)
     {
       const Elem * secondary_side_elem = *el;
-
-      const Real secondary_volume = secondary_side_elem->volume();
 
       // If this Elem is not in the current secondary subdomain, go on to the next one.
       if (secondary_side_elem->subdomain_id() != secondary_subd_id)
@@ -1048,8 +1219,12 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
       libmesh_ignore(insertion_happened);
       auto & secondary_to_msm_element_set = secondary_elem_to_msm_map_it->second;
 
-      std::vector<std::unique_ptr<MortarSegmentHelper>> mortar_segment_helper(
-          secondary_side_elem->n_sub_elem());
+      std::vector<MortarSegmentHelper *> mortar_segment_helper(secondary_side_elem->n_sub_elem(),
+                                                               nullptr);
+      std::vector<std::unique_ptr<MortarSegmentHelper>> owned_mortar_segment_helpers;
+      owned_mortar_segment_helpers.reserve(secondary_side_elem->n_sub_elem());
+      std::vector<Real> secondary_sub_elem_measures(secondary_side_elem->n_sub_elem(), 0.);
+      std::vector<bool> secondary_sub_elem_had_overlap(secondary_side_elem->n_sub_elem(), false);
       const auto nodal_normals = getNodalNormals(*secondary_side_elem);
 
       /**
@@ -1065,7 +1240,7 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
       for (auto sel : make_range(secondary_side_elem->n_sub_elem()))
       {
         // Get indices of sub-element nodes in element
-        auto sub_elem_nodes = get_sub_elem_nodes(secondary_side_elem->type(), sel);
+        auto sub_elem_nodes = getMortarSubElemNodes(secondary_side_elem->type(), sel);
 
         // Secondary sub-element center, normal, and nodes
         Point center;
@@ -1084,8 +1259,27 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
         normal = normal.unit();
 
         // Build and store linearized sub-elements for later use
-        mortar_segment_helper[sel] = std::make_unique<MortarSegmentHelper>(
-            nodes, center, normal, _triangulation_mode, _triangulate_triangles);
+        if (use_global_polygon_mesh)
+        {
+          const SecondarySubElemKey helper_key{secondary_side_elem->id(), sel};
+          auto [helper_it, inserted] =
+              overlay_helpers.emplace(helper_key, std::unique_ptr<MortarSegmentHelper>{});
+          if (inserted || !helper_it->second)
+            helper_it->second = std::make_unique<MortarSegmentHelper>(
+                nodes, center, normal, _triangulation_mode, _triangulate_triangles);
+          mortar_segment_helper[sel] = helper_it->second.get();
+        }
+        else
+        {
+          owned_mortar_segment_helpers.push_back(std::make_unique<MortarSegmentHelper>(
+              nodes, center, normal, _triangulation_mode, _triangulate_triangles));
+          mortar_segment_helper[sel] = owned_mortar_segment_helpers.back().get();
+        }
+
+        secondary_sub_elem_measures[sel] = mortar_segment_helper[sel]->area(
+            mortar_segment_helper[sel]->secondaryPoly());
+        secondary_sub_elem_measure_cache[{secondary_side_elem->id(), sel}] =
+            secondary_sub_elem_measures[sel];
       }
 
       /**
@@ -1175,6 +1369,8 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
         if (processed_primary_elems.count(primary_elem_candidate))
           continue;
 
+        bool current_primary_had_overlap = false;
+
         // Initialize set of nodes used to construct mortar segment elements
         std::vector<Point> nodal_points;
 
@@ -1191,7 +1387,7 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
         for (auto p_el : make_range(primary_elem_candidate->n_sub_elem()))
         {
           // Get nodes of primary sub-elements
-          auto sub_elem_nodes = get_sub_elem_nodes(primary_elem_candidate->type(), p_el);
+          auto sub_elem_nodes = getMortarSubElemNodes(primary_elem_candidate->type(), p_el);
 
           // Get list of primary sub-element vertex nodes
           std::vector<Point> primary_sub_elem(sub_elem_nodes.size());
@@ -1204,19 +1400,35 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
           // Loop through secondary sub-elements
           for (auto s_el : make_range(secondary_side_elem->n_sub_elem()))
           {
-            // Mortar segment helpers were defined for each secondary sub-element, they will:
-            //  1. Project primary sub-element onto linearized secondary sub-element
-            //  2. Clip projected primary sub-element against secondary sub-element
-            //  3. Triangulate clipped polygon to form mortar segments
-            //
-            // Mortar segment helpers append a list of mortar segment nodes and connectivities that
-            // can be directly used to build mortar segments
-            mortar_segment_helper[s_el]->getMortarSegments(
-                primary_sub_elem, nodal_points, elem_to_node_map);
+            if (use_global_polygon_mesh)
+            {
+              auto clipped_poly = mortar_segment_helper[s_el]->clipPoly(primary_sub_elem);
+              if (clipped_poly.size() < 3)
+                continue;
 
-            // Keep track of which secondary and primary sub-elements created segment
-            for (auto i = sub_elem_map.size(); i < elem_to_node_map.size(); ++i)
-              sub_elem_map.push_back(std::make_pair(s_el, p_el));
+              current_primary_had_overlap = true;
+              secondary_sub_elem_had_overlap[s_el] = true;
+              pending_overlay_polygons.push_back({secondary_side_elem,
+                                                  primary_elem_candidate,
+                                                  mortar_segment_helper[s_el],
+                                                  s_el,
+                                                  p_el,
+                                                  std::move(clipped_poly),
+                                                  mortar_segment_helper[s_el]->projectPrimaryPoly(
+                                                      primary_sub_elem)});
+            }
+            else
+            {
+              const auto nodes_begin = nodal_points.size();
+              mortar_segment_helper[s_el]->getMortarSegments(
+                  primary_sub_elem, nodal_points, elem_to_node_map);
+
+              if (nodal_points.size() > nodes_begin)
+                secondary_sub_elem_had_overlap[s_el] = true;
+
+              for (auto i = sub_elem_map.size(); i < elem_to_node_map.size(); ++i)
+                sub_elem_map.push_back(std::make_pair(s_el, p_el));
+            }
           }
         }
 
@@ -1225,7 +1437,9 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
         primary_elem_candidates.erase(primary_elem_candidate);
 
         // If overlap of polygons was non-trivial (created mortar segment elements)
-        if (!elem_to_node_map.empty())
+        const bool nontrivial_overlap =
+            use_global_polygon_mesh ? current_primary_had_overlap : !elem_to_node_map.empty();
+        if (nontrivial_overlap)
         {
           // If this is the first element with non-trivial overlap, set flag
           // Candidates will now be neighbors of elements that had non-trivial overlap
@@ -1249,61 +1463,13 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
             primary_elem_candidates.insert(neighbor);
           }
 
-          /**
-           * Step 1.3.3: Create mortar segments and add to mortar segment mesh
-           */
-          std::vector<Node *> new_nodes;
-          for (auto pt : nodal_points)
-            new_nodes.push_back(_mortar_segment_mesh->add_point(
-                pt, _mortar_segment_mesh->max_node_id(), secondary_side_elem->processor_id()));
-
-          // Loop through triangular elements in map
-          for (auto el : index_range(elem_to_node_map))
-          {
-            // Create new triangular element
-            std::unique_ptr<Elem> new_elem;
-            if (elem_to_node_map[el].size() == 3)
-              new_elem = std::make_unique<Tri3>();
-            else
-              mooseError("Active mortar segments only supports TRI elements, 3 nodes expected "
-                         "but: ",
-                         elem_to_node_map[el].size(),
-                         " provided.");
-
-            new_elem->processor_id() = secondary_side_elem->processor_id();
-            new_elem->subdomain_id() = secondary_side_elem->subdomain_id();
-            new_elem->set_id(local_id_index++);
-
-            // Attach newly created nodes
-            for (auto i : index_range(elem_to_node_map[el]))
-              new_elem->set_node(i, new_nodes[elem_to_node_map[el][i]]);
-
-            // If element is smaller than tolerance, don't add to msm
-            if (new_elem->volume() / secondary_volume < TOLERANCE)
-              continue;
-
-            // Add elements to mortar segment mesh
-            Elem * msm_new_elem = _mortar_segment_mesh->add_elem(new_elem.release());
-
-            msm_new_elem->set_extra_integer(secondary_sub_elem, sub_elem_map[el].first);
-            msm_new_elem->set_extra_integer(primary_sub_elem, sub_elem_map[el].second);
-
-            // Fill out mortar segment info
-            MortarSegmentInfo msinfo;
-            msinfo.secondary_elem = secondary_side_elem;
-            msinfo.primary_elem = primary_elem_candidate;
-
-            // Associate this MSM elem with the MortarSegmentInfo.
-            _msm_elem_to_info.emplace(msm_new_elem, msinfo);
-
-            // Add this mortar segment to the secondary elem to mortar segment map
-            secondary_to_msm_element_set.insert(msm_new_elem);
-
-            _secondary_ip_sub_ids.insert(msinfo.secondary_elem->interior_parent()->subdomain_id());
-            // Unlike for 2D, we always have a primary when building the mortar mesh so we don't
-            // have to check for null
-            _primary_ip_sub_ids.insert(msinfo.primary_elem->interior_parent()->subdomain_id());
-          }
+          if (!use_global_polygon_mesh)
+            materialize_mortar_segment_batch(secondary_side_elem,
+                                             primary_elem_candidate,
+                                             nodal_points,
+                                             elem_to_node_map,
+                                             sub_elem_map,
+                                             secondary_to_msm_element_set);
         }
         // End loop through primary element candidates
       }
@@ -1311,7 +1477,7 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
       for (auto sel : make_range(secondary_side_elem->n_sub_elem()))
       {
         // Check if any segments failed to project
-        if (mortar_segment_helper[sel]->remainder() == 1.0)
+        if (!secondary_sub_elem_had_overlap[sel])
           mooseDoOnce(
               mooseWarning("Some secondary elements on mortar interface were unable to identify"
                            " a corresponding primary element; this may be expected depending on"
@@ -1319,10 +1485,705 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
                            " or projection"));
       }
 
-      if (secondary_to_msm_element_set.empty())
+      if (!use_global_polygon_mesh && secondary_to_msm_element_set.empty())
         _secondary_elems_to_mortar_segments.erase(secondary_elem_to_msm_map_it);
     } // End loop through secondary elements
   } // End loop through mortar constraint pairs
+
+  if (use_global_polygon_mesh && !pending_overlay_polygons.empty())
+  {
+    std::map<SecondarySubElemKey, std::vector<const PendingOverlayPolygon *>>
+        polygons_by_secondary_sub_elem;
+    for (const auto & polygon : pending_overlay_polygons)
+      polygons_by_secondary_sub_elem[{polygon.secondary_elem->id(), polygon.secondary_sub_elem}]
+          .push_back(&polygon);
+
+    const auto polygon_sort_centroid = [](const std::vector<Point> & polygon)
+    {
+      Point centroid(0);
+      for (const auto & point : polygon)
+        centroid += point;
+      if (!polygon.empty())
+        centroid /= polygon.size();
+      centroid(2) = 0.;
+      return centroid;
+    };
+
+    for (auto & [secondary_key, polygons] : polygons_by_secondary_sub_elem)
+    {
+      libmesh_ignore(secondary_key);
+      std::sort(polygons.begin(),
+                polygons.end(),
+                [&polygon_sort_centroid](const PendingOverlayPolygon * const left,
+                                         const PendingOverlayPolygon * const right)
+                {
+                  mooseAssert(left && right, "Expected valid pending overlay polygons.");
+
+                  const auto left_centroid = polygon_sort_centroid(left->local_nodes);
+                  const auto right_centroid = polygon_sort_centroid(right->local_nodes);
+
+                  return std::make_tuple(left->primary_elem->id(),
+                                         left->primary_sub_elem,
+                                         left->local_nodes.size(),
+                                         left_centroid(0),
+                                         left_centroid(1)) <
+                         std::make_tuple(right->primary_elem->id(),
+                                         right->primary_sub_elem,
+                                         right->local_nodes.size(),
+                                         right_centroid(0),
+                                         right_centroid(1));
+                });
+    }
+
+    for (const auto & [secondary_key, polygons] : polygons_by_secondary_sub_elem)
+    {
+      libmesh_ignore(secondary_key);
+      if (polygons.empty())
+        continue;
+
+      const auto * const helper = polygons.front()->helper;
+      const auto * const secondary_elem = polygons.front()->secondary_elem;
+      auto & secondary_to_msm_element_set = _secondary_elems_to_mortar_segments[secondary_elem->id()];
+
+      const Real area_tol = helper->areaTolerance();
+      const Real length_tol = helper->lengthTolerance();
+
+      struct OverlaySegment
+      {
+        Point start;
+        Point end;
+      };
+
+      const auto points_close = [length_tol](const Point & left, const Point & right)
+      { return (left - right).norm() <= length_tol; };
+
+      const auto unique_point_index =
+          [&points_close](std::vector<Point> & points, const Point & point)
+      {
+        for (const auto i : index_range(points))
+          if (points_close(points[i], point))
+            return static_cast<unsigned int>(i);
+
+        points.push_back(point);
+        return static_cast<unsigned int>(points.size() - 1);
+      };
+
+      const auto append_unique_point =
+          [&points_close](std::vector<Point> & points, const Point & point)
+      {
+        for (const auto & existing : points)
+          if (points_close(existing, point))
+            return;
+        points.push_back(point);
+      };
+
+      const auto point_on_segment =
+          [area_tol, length_tol](const Point & point, const Point & start, const Point & end)
+      {
+        if (std::abs(orient2d(start, end, point)) > area_tol)
+          return false;
+
+        const Point segment = end - start;
+        const Point from_start = point - start;
+        const Point from_end = point - end;
+        const Real segment_norm_sq = segment.norm_sq();
+        if (segment_norm_sq <= length_tol * length_tol)
+          return from_start.norm() <= length_tol;
+
+        const Real scaled_tol = length_tol * std::sqrt(segment_norm_sq);
+        return (from_start * segment) >= -scaled_tol && (from_end * segment) <= scaled_tol;
+      };
+
+      const auto segment_parameter = [&points_close](const Point & point, const OverlaySegment & segment)
+      {
+        if (points_close(point, segment.start))
+          return 0.;
+        const Point direction = segment.end - segment.start;
+        const Real direction_norm_sq = direction.norm_sq();
+        if (direction_norm_sq <= TOLERANCE)
+          return 0.;
+        return ((point - segment.start) * direction) / direction_norm_sq;
+      };
+
+      const auto polygon_signed_margin = [](const std::vector<Point> & polygon, const Point & point)
+          -> std::optional<Real>
+      {
+        if (polygon.size() < 3)
+          return std::nullopt;
+
+        Real min_margin = std::numeric_limits<Real>::max();
+        for (const auto i : index_range(polygon))
+        {
+          const auto margin = orient2d(polygon[i], polygon[(i + 1) % polygon.size()], point);
+          if (margin < -TOLERANCE)
+            return std::nullopt;
+          min_margin = std::min(min_margin, margin);
+        }
+        return min_margin;
+      };
+
+      const auto polygon_face_support_margin =
+          [&polygon_signed_margin](const std::vector<Point> & polygon,
+                                   const std::vector<Point> & face_polygon,
+                                   const Point & centroid) -> std::optional<Real>
+      {
+        const auto centroid_margin = polygon_signed_margin(polygon, centroid);
+        if (!centroid_margin)
+          return std::nullopt;
+
+        Real support_margin = *centroid_margin;
+        for (const auto & face_point : face_polygon)
+        {
+          const auto point_margin = polygon_signed_margin(polygon, face_point);
+          if (!point_margin)
+            return std::nullopt;
+          support_margin = std::min(support_margin, *point_margin);
+        }
+
+        return support_margin;
+      };
+
+      std::vector<OverlaySegment> overlay_segments;
+      overlay_segments.reserve(helper->secondaryPoly().size() +
+                               std::accumulate(polygons.begin(),
+                                               polygons.end(),
+                                               static_cast<std::size_t>(0),
+                                               [](const std::size_t count,
+                                                  const PendingOverlayPolygon * const polygon)
+                                               { return count + polygon->local_nodes.size(); }));
+
+      const auto & secondary_polygon = helper->secondaryPoly();
+      for (const auto i : index_range(secondary_polygon))
+        overlay_segments.push_back(
+            {secondary_polygon[i], secondary_polygon[(i + 1) % secondary_polygon.size()]});
+
+      for (const auto * const polygon : polygons)
+        for (const auto i : index_range(polygon->local_nodes))
+          overlay_segments.push_back(
+              {polygon->local_nodes[i], polygon->local_nodes[(i + 1) % polygon->local_nodes.size()]});
+
+      std::vector<std::vector<Point>> segment_split_points(overlay_segments.size());
+      for (const auto i : index_range(overlay_segments))
+      {
+        segment_split_points[i].push_back(overlay_segments[i].start);
+        segment_split_points[i].push_back(overlay_segments[i].end);
+      }
+
+      for (const auto i : index_range(overlay_segments))
+        for (unsigned int j = i + 1; j < overlay_segments.size(); ++j)
+        {
+          const auto & first = overlay_segments[i];
+          const auto & second = overlay_segments[j];
+
+          const Real determinant = (first.end(0) - first.start(0)) * (second.end(1) - second.start(1)) -
+                                   (first.end(1) - first.start(1)) * (second.end(0) - second.start(0));
+
+          if (std::abs(determinant) > area_tol)
+          {
+            Real s;
+            const Point intersection =
+                helper->getIntersection(first.start, first.end, second.start, second.end, s);
+            if (point_on_segment(intersection, first.start, first.end) &&
+                point_on_segment(intersection, second.start, second.end))
+            {
+              append_unique_point(segment_split_points[i], intersection);
+              append_unique_point(segment_split_points[j], intersection);
+            }
+          }
+          else
+          {
+            for (const auto & candidate :
+                 {first.start, first.end, second.start, second.end})
+              if (point_on_segment(candidate, first.start, first.end) &&
+                  point_on_segment(candidate, second.start, second.end))
+              {
+                append_unique_point(segment_split_points[i], candidate);
+                append_unique_point(segment_split_points[j], candidate);
+              }
+          }
+        }
+
+      std::vector<Point> supermesh_nodes;
+      std::vector<std::pair<unsigned int, unsigned int>> pslg_segments;
+      std::set<std::array<unsigned int, 2>> unique_segments;
+      for (const auto i : index_range(overlay_segments))
+      {
+        auto split_points = segment_split_points[i];
+        std::sort(split_points.begin(),
+                  split_points.end(),
+                  [&overlay_segments, i, &segment_parameter](const Point & left, const Point & right)
+                  { return segment_parameter(left, overlay_segments[i]) <
+                           segment_parameter(right, overlay_segments[i]); });
+        split_points.erase(
+            std::unique(split_points.begin(),
+                        split_points.end(),
+                        [&points_close](const Point & left, const Point & right)
+                        { return points_close(left, right); }),
+            split_points.end());
+
+        for (const auto split_index : make_range(split_points.size() - 1))
+        {
+          if ((split_points[split_index + 1] - split_points[split_index]).norm() <= length_tol)
+            continue;
+
+          const auto start_index = unique_point_index(supermesh_nodes, split_points[split_index]);
+          const auto end_index = unique_point_index(supermesh_nodes, split_points[split_index + 1]);
+          if (start_index == end_index)
+            continue;
+
+          const auto canonical_segment = std::array<unsigned int, 2>{
+              {std::min(start_index, end_index), std::max(start_index, end_index)}};
+          if (!unique_segments.insert(canonical_segment).second)
+            continue;
+
+          pslg_segments.emplace_back(start_index, end_index);
+        }
+      }
+
+      if (supermesh_nodes.size() < 3 || pslg_segments.empty())
+        continue;
+
+      struct HalfEdge
+      {
+        unsigned int from = libMesh::invalid_uint;
+        unsigned int to = libMesh::invalid_uint;
+        unsigned int twin = libMesh::invalid_uint;
+        unsigned int next = libMesh::invalid_uint;
+        bool visited = false;
+        Real angle = 0;
+      };
+
+      const auto polygon_centroid = [](const std::vector<Point> & polygon)
+      {
+        Point centroid(0);
+        Real double_area = 0.;
+        for (const auto i : index_range(polygon))
+        {
+          const auto & start = polygon[i];
+          const auto & end = polygon[(i + 1) % polygon.size()];
+          const Real cross = start(0) * end(1) - end(0) * start(1);
+          double_area += cross;
+          centroid(0) += (start(0) + end(0)) * cross;
+          centroid(1) += (start(1) + end(1)) * cross;
+        }
+
+        if (std::abs(double_area) <= TOLERANCE)
+        {
+          for (const auto & point : polygon)
+            centroid += point;
+          centroid /= polygon.size();
+          centroid(2) = 0.;
+          return centroid;
+        }
+
+        centroid /= (3. * double_area);
+        centroid(2) = 0.;
+        return centroid;
+      };
+
+      std::vector<HalfEdge> half_edges;
+      half_edges.reserve(pslg_segments.size() * 2);
+      std::vector<std::vector<unsigned int>> outgoing_half_edges(supermesh_nodes.size());
+      for (const auto & [start, end] : pslg_segments)
+      {
+        const auto forward_index = static_cast<unsigned int>(half_edges.size());
+        const auto reverse_index = forward_index + 1;
+        const auto forward_direction = supermesh_nodes[end] - supermesh_nodes[start];
+        const auto reverse_direction = supermesh_nodes[start] - supermesh_nodes[end];
+
+        half_edges.push_back(
+            {start, end, reverse_index, libMesh::invalid_uint, false,
+             std::atan2(forward_direction(1), forward_direction(0))});
+        half_edges.push_back(
+            {end, start, forward_index, libMesh::invalid_uint, false,
+             std::atan2(reverse_direction(1), reverse_direction(0))});
+
+        outgoing_half_edges[start].push_back(forward_index);
+        outgoing_half_edges[end].push_back(reverse_index);
+      }
+
+      for (auto vertex_index : index_range(outgoing_half_edges))
+      {
+        auto & outgoing = outgoing_half_edges[vertex_index];
+        std::sort(outgoing.begin(),
+                  outgoing.end(),
+                  [&half_edges](const unsigned int left, const unsigned int right)
+                  { return half_edges[left].angle < half_edges[right].angle; });
+      }
+
+      for (auto half_edge_index : index_range(half_edges))
+      {
+        auto & half_edge = half_edges[half_edge_index];
+        auto & outgoing = outgoing_half_edges[half_edge.to];
+        const auto twin_it = std::find(outgoing.begin(), outgoing.end(), half_edge.twin);
+        if (twin_it == outgoing.end())
+          continue;
+
+        const auto twin_position = static_cast<unsigned int>(std::distance(outgoing.begin(), twin_it));
+        const auto next_position = (twin_position + outgoing.size() - 1) % outgoing.size();
+        half_edge.next = outgoing[next_position];
+      }
+
+      struct OwnedAtomicFace
+      {
+        const PendingOverlayPolygon * owner = nullptr;
+        std::vector<unsigned int> node_indices;
+      };
+
+      std::vector<OwnedAtomicFace> owned_atomic_faces;
+
+      const auto materialize_owner_polygon =
+          [&](const PendingOverlayPolygon * owner,
+              const std::vector<unsigned int> & polygon_node_indices)
+      {
+        if (!owner || polygon_node_indices.size() < 3)
+          return;
+
+        std::vector<Point> local_nodes;
+        local_nodes.reserve(polygon_node_indices.size());
+        for (const auto node_index : polygon_node_indices)
+          local_nodes.push_back(supermesh_nodes[node_index]);
+
+        std::vector<std::vector<unsigned int>> elem_to_node_map;
+        owner->helper->triangulatePoly(local_nodes, 0, elem_to_node_map);
+        if (elem_to_node_map.empty())
+          return;
+
+        std::vector<Point> nodal_points;
+        nodal_points.reserve(local_nodes.size());
+        for (const auto & local_node : local_nodes)
+          nodal_points.push_back(owner->helper->physicalPoint(local_node));
+
+        std::vector<std::pair<unsigned int, unsigned int>> sub_elem_map(
+            elem_to_node_map.size(),
+            std::make_pair(owner->secondary_sub_elem, owner->primary_sub_elem));
+        materialize_mortar_segment_batch(owner->secondary_elem,
+                                         owner->primary_elem,
+                                         nodal_points,
+                                         elem_to_node_map,
+                                         sub_elem_map,
+                                         secondary_to_msm_element_set);
+      };
+
+      for (auto half_edge_index : index_range(half_edges))
+      {
+        if (half_edges[half_edge_index].visited ||
+            half_edges[half_edge_index].next == libMesh::invalid_uint)
+          continue;
+
+        std::vector<unsigned int> face_node_indices;
+        unsigned int current_half_edge = half_edge_index;
+        bool closed_face = false;
+        for (unsigned int step = 0; step < half_edges.size(); ++step)
+        {
+          auto & current = half_edges[current_half_edge];
+          if (current.visited)
+            break;
+
+          current.visited = true;
+          face_node_indices.push_back(current.from);
+          current_half_edge = current.next;
+          if (current_half_edge == half_edge_index)
+          {
+            closed_face = true;
+            break;
+          }
+        }
+
+        if (!closed_face || face_node_indices.size() < 3)
+          continue;
+
+        std::vector<Point> face_polygon;
+        face_polygon.reserve(face_node_indices.size());
+        for (const auto node_index : face_node_indices)
+        {
+          if (!face_polygon.empty() && points_close(face_polygon.back(), supermesh_nodes[node_index]))
+            continue;
+          face_polygon.push_back(supermesh_nodes[node_index]);
+        }
+
+        if (face_polygon.size() >= 2 && points_close(face_polygon.front(), face_polygon.back()))
+          face_polygon.pop_back();
+        if (face_polygon.size() < 3)
+          continue;
+
+        Real signed_face_area = 0.;
+        for (const auto i : index_range(face_polygon))
+          signed_face_area += face_polygon[i](0) * face_polygon[(i + 1) % face_polygon.size()](1) -
+                              face_polygon[i](1) * face_polygon[(i + 1) % face_polygon.size()](0);
+        signed_face_area *= 0.5;
+        if (signed_face_area <= area_tol)
+          continue;
+
+        const auto centroid = polygon_centroid(face_polygon);
+        const auto choose_owner = [&](auto polygon_accessor, const bool require_face_support)
+        {
+          const PendingOverlayPolygon * owner = nullptr;
+          Real owner_score = -std::numeric_limits<Real>::max();
+
+          for (const auto * const polygon : polygons)
+          {
+            const auto margin =
+                require_face_support
+                    ? polygon_face_support_margin(polygon_accessor(*polygon), face_polygon, centroid)
+                    : polygon_signed_margin(polygon_accessor(*polygon), centroid);
+            if (margin)
+            {
+              if (*margin > owner_score + 10. * length_tol)
+              {
+                owner = polygon;
+                owner_score = *margin;
+                continue;
+              }
+
+              if (!owner || std::abs(*margin - owner_score) > 10. * length_tol)
+                continue;
+
+              const auto candidate_key =
+                  std::make_pair(polygon->primary_elem->id(), polygon->primary_sub_elem);
+              const auto owner_key = std::make_pair(owner->primary_elem->id(), owner->primary_sub_elem);
+              if (candidate_key < owner_key)
+              {
+                owner = polygon;
+                owner_score = *margin;
+              }
+            }
+          }
+
+          return std::make_pair(owner, owner_score);
+        };
+
+        const auto centroid_in_overlap_union = [&](auto polygon_accessor, const Real tolerance)
+        {
+          for (const auto * const polygon : polygons)
+            if (const auto margin = polygon_signed_margin(polygon_accessor(*polygon), centroid))
+              if (*margin >= -tolerance)
+                return true;
+
+          return false;
+        };
+
+        const Real owner_tolerance = 10. * length_tol;
+        const Real relaxed_owner_tolerance = 10. * owner_tolerance;
+        const bool face_in_overlap_union =
+            centroid_in_overlap_union(
+                [](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                { return polygon.local_nodes; },
+                relaxed_owner_tolerance) ||
+            centroid_in_overlap_union(
+                [](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                { return polygon.projected_primary_nodes; },
+                relaxed_owner_tolerance);
+
+        if (!face_in_overlap_union)
+          continue;
+
+        auto [owner, owner_score] =
+            choose_owner([](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                         { return polygon.local_nodes; },
+                         true);
+
+        if (!owner || owner_score < -owner_tolerance)
+          std::tie(owner, owner_score) =
+              choose_owner([](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                           { return polygon.projected_primary_nodes; },
+                           true);
+
+        if (!owner || owner_score < -owner_tolerance)
+          std::tie(owner, owner_score) =
+              choose_owner([](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                           { return polygon.local_nodes; },
+                           false);
+
+        if (!owner || owner_score < -relaxed_owner_tolerance)
+          std::tie(owner, owner_score) =
+              choose_owner([](const PendingOverlayPolygon & polygon) -> const std::vector<Point> &
+                           { return polygon.projected_primary_nodes; },
+                           false);
+
+        if (!owner || owner_score < -relaxed_owner_tolerance)
+        {
+          // The planar arrangement can contain background/noise faces that are not owned by any
+          // overlap polygon. Those faces do not belong in the mortar mesh and are skipped.
+          continue;
+        }
+
+        owned_atomic_faces.push_back({owner, std::move(face_node_indices)});
+      }
+
+      using OwnerKey = std::tuple<dof_id_type, unsigned int, dof_id_type, unsigned int>;
+      std::map<OwnerKey, std::vector<const OwnedAtomicFace *>> atomic_faces_by_owner;
+      for (const auto & owned_atomic_face : owned_atomic_faces)
+        atomic_faces_by_owner[{owned_atomic_face.owner->secondary_elem->id(),
+                               owned_atomic_face.owner->secondary_sub_elem,
+                               owned_atomic_face.owner->primary_elem->id(),
+                               owned_atomic_face.owner->primary_sub_elem}]
+            .push_back(&owned_atomic_face);
+
+      const auto choose_next_boundary_edge =
+          [&](const unsigned int current_node,
+              const unsigned int previous_node,
+              const std::vector<std::pair<unsigned int, unsigned int>> & boundary_edges,
+              const std::vector<bool> & used_boundary_edges,
+              const std::vector<std::vector<unsigned int>> & outgoing_boundary_edges)
+      {
+        const auto & candidates = outgoing_boundary_edges[current_node];
+        if (candidates.empty())
+          return libMesh::invalid_uint;
+
+        unsigned int best_edge = libMesh::invalid_uint;
+        Real best_turn = std::numeric_limits<Real>::max();
+
+        const Point incoming =
+            previous_node == libMesh::invalid_uint ? Point(0)
+                                                   : supermesh_nodes[current_node] -
+                                                         supermesh_nodes[previous_node];
+
+        for (const auto edge_index : candidates)
+        {
+          if (used_boundary_edges[edge_index])
+            continue;
+
+          if (previous_node == libMesh::invalid_uint)
+            return edge_index;
+
+          const auto & edge = boundary_edges[edge_index];
+          const Point outgoing = supermesh_nodes[edge.second] - supermesh_nodes[edge.first];
+          Real turn = std::atan2(incoming(0) * outgoing(1) - incoming(1) * outgoing(0),
+                                 incoming(0) * outgoing(0) + incoming(1) * outgoing(1));
+          if (turn < -TOLERANCE)
+            turn += 2. * libMesh::pi;
+
+          if (turn < best_turn)
+          {
+            best_turn = turn;
+            best_edge = edge_index;
+          }
+        }
+
+        return best_edge;
+      };
+
+      const auto simplify_polygon_loop = [&](std::vector<unsigned int> & polygon_loop)
+      {
+        bool changed = true;
+        while (changed && polygon_loop.size() >= 3)
+        {
+          changed = false;
+          for (std::size_t i = 0; i < polygon_loop.size(); ++i)
+          {
+            const auto previous_index = polygon_loop[(i + polygon_loop.size() - 1) % polygon_loop.size()];
+            const auto current_index = polygon_loop[i];
+            const auto next_index = polygon_loop[(i + 1) % polygon_loop.size()];
+
+            const auto & previous_point = supermesh_nodes[previous_index];
+            const auto & current_point = supermesh_nodes[current_index];
+            const auto & next_point = supermesh_nodes[next_index];
+
+            if (points_close(previous_point, current_point) ||
+                points_close(current_point, next_point) ||
+                point_on_segment(current_point, previous_point, next_point))
+            {
+              polygon_loop.erase(polygon_loop.begin() + i);
+              changed = true;
+              break;
+            }
+          }
+        }
+      };
+
+      for (const auto & [owner_key, atomic_faces] : atomic_faces_by_owner)
+      {
+        libmesh_ignore(owner_key);
+        if (atomic_faces.empty())
+          continue;
+
+        const auto * const owner = atomic_faces.front()->owner;
+        std::map<std::pair<unsigned int, unsigned int>, int> directed_edge_balance;
+        for (const auto * const atomic_face : atomic_faces)
+          for (const auto i : index_range(atomic_face->node_indices))
+          {
+            const auto from = atomic_face->node_indices[i];
+            const auto to = atomic_face->node_indices[(i + 1) % atomic_face->node_indices.size()];
+            directed_edge_balance[{from, to}] += 1;
+            directed_edge_balance[{to, from}] -= 1;
+          }
+
+        std::vector<std::pair<unsigned int, unsigned int>> boundary_edges;
+        for (const auto & [edge, balance] : directed_edge_balance)
+          if (balance > 0)
+            for (const auto copy : make_range(static_cast<unsigned int>(balance)))
+            {
+              libmesh_ignore(copy);
+              boundary_edges.push_back(edge);
+            }
+
+        if (boundary_edges.empty())
+          continue;
+
+        std::vector<std::vector<unsigned int>> outgoing_boundary_edges(supermesh_nodes.size());
+        for (const auto edge_index : index_range(boundary_edges))
+          outgoing_boundary_edges[boundary_edges[edge_index].first].push_back(edge_index);
+
+        std::vector<bool> used_boundary_edges(boundary_edges.size(), false);
+        for (const auto start_edge_index : index_range(boundary_edges))
+        {
+          if (used_boundary_edges[start_edge_index])
+            continue;
+
+          std::vector<unsigned int> polygon_loop;
+          unsigned int current_edge_index = start_edge_index;
+          unsigned int previous_node = libMesh::invalid_uint;
+          const unsigned int start_node = boundary_edges[current_edge_index].first;
+          bool closed_loop = false;
+
+          for (unsigned int step = 0; step < boundary_edges.size(); ++step)
+          {
+            if (used_boundary_edges[current_edge_index])
+              break;
+
+            used_boundary_edges[current_edge_index] = true;
+            const auto & current_edge = boundary_edges[current_edge_index];
+            polygon_loop.push_back(current_edge.first);
+
+            previous_node = current_edge.first;
+            const auto current_node = current_edge.second;
+            if (current_node == start_node)
+            {
+              closed_loop = true;
+              break;
+            }
+
+            const auto next_edge_index =
+                choose_next_boundary_edge(current_node,
+                                          previous_node,
+                                          boundary_edges,
+                                          used_boundary_edges,
+                                          outgoing_boundary_edges);
+            if (next_edge_index == libMesh::invalid_uint)
+              break;
+
+            current_edge_index = next_edge_index;
+          }
+
+          if (!closed_loop || polygon_loop.size() < 3)
+            continue;
+
+          simplify_polygon_loop(polygon_loop);
+          if (polygon_loop.size() < 3)
+            continue;
+
+          materialize_owner_polygon(owner, polygon_loop);
+        }
+      }
+    }
+
+    for (auto it = _secondary_elems_to_mortar_segments.begin(); it != _secondary_elems_to_mortar_segments.end();)
+      if (it->second.empty())
+        it = _secondary_elems_to_mortar_segments.erase(it);
+      else
+        ++it;
+  }
 
   _mortar_segment_mesh->cache_elem_data();
 

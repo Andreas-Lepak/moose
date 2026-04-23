@@ -117,6 +117,11 @@ MortarConsumerInterface::validParams()
       triangulation,
       "Strategy used to triangulate clipped 3D mortar polygons into mortar segments.");
   params.addParam<bool>(
+      "global_polygon_mesh",
+      false,
+      "Whether 3D overlap polygons should first be assembled into a continuous polygonal "
+      "supermesh before triangulating each final polygon cell.");
+  params.addParam<bool>(
       "triangulate_triangles",
       false,
       "Whether a clipped 3D mortar polygon that is already a triangle should still be subdivided "
@@ -175,6 +180,7 @@ MortarConsumerInterface::MortarConsumerInterface(const MooseObject * moose_objec
       moose_object->getParam<bool>("correct_edge_dropping"),
       moose_object->getParam<Real>("minimum_projection_angle"),
       moose_object->getParam<MooseEnum>("triangulation"),
+      moose_object->getParam<bool>("global_polygon_mesh"),
       moose_object->getParam<bool>("triangulate_triangles"));
 
   _amg = &_mci_fe_problem.getMortarInterface(
