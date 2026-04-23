@@ -223,7 +223,9 @@ AutomaticMortarGeneration::AutomaticMortarGeneration(
     bool periodic,
     const bool debug,
     const bool correct_edge_dropping,
-    const Real minimum_projection_angle)
+    const Real minimum_projection_angle,
+    const MortarSegmentTriangulationMode triangulation_mode,
+    const bool triangulate_triangles)
   : ConsoleStreamInterface(app),
     _app(app),
     _mesh(mesh_in),
@@ -233,7 +235,9 @@ AutomaticMortarGeneration::AutomaticMortarGeneration(
     // We always ghost the entire mortar interface when it is allowed to displace
     _distributed(_on_displaced ? false : !_mesh.is_replicated()),
     _correct_edge_dropping(correct_edge_dropping),
-    _minimum_projection_angle(minimum_projection_angle)
+    _minimum_projection_angle(minimum_projection_angle),
+    _triangulation_mode(triangulation_mode),
+    _triangulate_triangles(triangulate_triangles)
 {
   _primary_secondary_boundary_id_pairs.push_back(boundary_key);
   _primary_requested_boundary_ids.insert(boundary_key.first);
@@ -1080,7 +1084,8 @@ AutomaticMortarGeneration::buildMortarSegmentMesh3d()
         normal = normal.unit();
 
         // Build and store linearized sub-elements for later use
-        mortar_segment_helper[sel] = std::make_unique<MortarSegmentHelper>(nodes, center, normal);
+        mortar_segment_helper[sel] = std::make_unique<MortarSegmentHelper>(
+            nodes, center, normal, _triangulation_mode, _triangulate_triangles);
       }
 
       /**
